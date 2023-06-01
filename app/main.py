@@ -6,9 +6,9 @@ from fastapi import FastAPI, UploadFile, File, HTTPException, File, Form, Upload
 from fastapi.responses import FileResponse, HTMLResponse
 from app.utils import create_grid
 from .config import settings
-from .loadmodel import *
 from .database import *
 import os
+from contextlib import asynccontextmanager
 import aiofiles
 import torch
 from ultralytics import YOLO
@@ -17,6 +17,26 @@ from enum import Enum
 
 CHUNK_SIZE = 1024 * 1024
 db_model = get_all_model()
+
+ml_models = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Load the ML model
+    ml_models["yolov5"] = torch.hub.load('app\models\yolov5', 'custom',
+                                         path=r'app\weight\yolov5s.pt',
+                                         source='local', verbose=False)
+    ml_models["yolov5onnx"] = torch.hub.load('app\models\yolov5', 'custom',
+                                             path=r'app\weight\yolov5.onnx',
+                                             source='local', verbose=False)
+    ml_models["yolov8"] = YOLO("app\weight\yolov8.pt")
+    ml_models["yolov8onnx"] = YOLO("app\weight\yolov8.onnx", task="detect")
+    yield
+    # Clean up the ML models and release the resources
+    ml_models.clear()
+
+
 app = FastAPI(
     title="Quick Detect",
     description="""
@@ -28,6 +48,7 @@ app = FastAPI(
         - yolov8 (pyTorch Only)
     Supported image format: JPG and JPEG
     """,
+    lifespan=lifespan
 )
 
 
@@ -38,16 +59,18 @@ def check_file_type(file: UploadFile = File()):
             status_code=400, detail="File must be an image (JPG or JPEG format)")
 
 
-@app.on_event("startup")
-async def startup_event():
-    global yolov5, yolov5onnx, yolov8
-    yolov5 = torch.hub.load('app\models\yolov5', 'custom',
-                            path=r'app\weight\yolov5s.pt',
-                            source='local', verbose=False)
-    yolov5onnx = torch.hub.load('app\models\yolov5', 'custom',
-                                path=r'app\weight\yolov5s.onnx',
-                                source='local', verbose=False)
-    yolov8 = YOLO("app\weight\yolov8n.pt")
+# @app.on_event("startup")
+# async def startup_event():
+#     # construct class
+#     global yolov5, yolov5onnx, yolov8, yolov8onnx
+#     yolov5 = torch.hub.load('app\models\yolov5', 'custom',
+#                             path=r'app\weight\yolov5s.pt',
+#                             source='local', verbose=False)
+#     yolov5onnx = torch.hub.load('app\models\yolov5', 'custom',
+#                                 path=r'app\weight\yolov5.onnx',
+#                                 source='local', verbose=False)
+#     yolov8 = YOLO("app\weight\yolov8.pt")
+#     yolov8onnx = YOLO("app\weight\yolov8.onnx", task="detect")
 
 
 @app.get("/")
@@ -59,6 +82,7 @@ class SupportedModelType(str, Enum):
     yolov5 = "yolov5"
     yolov5_onnx = "yolov5_onnx"
     yolov8 = "yolov8"
+    yolov8_onnx = "yolov8_onnx"
 
 
 @app.post("/yolov5", tags=["Predict How Many Trees in the picture"])
@@ -77,7 +101,7 @@ async def useyolov5(image_file: UploadFile = File()):
         buffer.write(await image_file.read())
 
     try:
-        result = yolov5(image_path)
+        result = ml_models['yolov5'](image_path)
         img_result = create_grid(image_path, result)
         cv2.imwrite(f"{output_path}/result.jpg", img_result)
         time = {
@@ -126,7 +150,7 @@ async def useyolov5onnx(image_file: UploadFile = File()):
         buffer.write(await image_file.read())
 
     try:
-        result = yolov5onnx(image_path)
+        result = ml_models['yolov5onnx'](image_path)
         img_result = create_grid(image_path, result)
         cv2.imwrite(f"{output_path}/result.jpg", img_result)
         time = {
@@ -175,7 +199,60 @@ async def useyolov8(image_file: UploadFile = File()):
         buffer.write(await image_file.read())
 
     try:
-        result = yolov8(image_path)
+        result = ml_models['yolov8'](image_path)
+        cv2.imwrite(f'{output_path}/result.jpg', result[0].plot())
+        result = result[0]
+
+        resultData = {}
+        if result.boxes:
+            for c in result.boxes.cls.unique():
+                n = (result.boxes.cls == c).sum()
+                resultData[result.names[int(c)]] = int(n)
+
+        time = {
+            "pre-process": result.speed['preprocess'],
+            "inference": result.speed['inference'],
+            "post-process": result.speed['postprocess']
+        }
+
+        returniddb = insert_result(uniqie_id, "yolov8", time, resultData)
+
+        if not returniddb.inserted_id:
+            raise HTTPException(
+                status_code=500, detail="Error while saving the result to the database")
+
+        return {
+            "status": "success",
+            "message": f"you can see the result in http://localhost:8000/get_result/{uniqie_id}",
+            "data": {
+                "id": str(returniddb.inserted_id),
+                "model": "yolov8",
+                "speed": time,
+                "result": resultData,
+            }}
+    except Exception as e:
+        # Delete the output folder if there is an error
+        shutil.rmtree(output_path)
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/yolov8onnx", tags=["Predict How Many Trees in the picture"])
+async def useyolov8onnx(image_file: UploadFile = File()):
+    check_file_type(image_file)
+
+    uniqie_id = str(uuid.uuid1())
+    output_path = settings.OUTPUT_DIR + '/' + uniqie_id
+
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+
+    # Save the image to the output folder
+    image_path = output_path + '/' + 'original.jpg'
+    with open(image_path, "wb") as buffer:
+        buffer.write(await image_file.read())
+
+    try:
+        result = ml_models['yolov8onnx'](image_path)
         cv2.imwrite(f'{output_path}/result.jpg', result[0].plot())
         result = result[0]
 
@@ -220,7 +297,7 @@ async def upload_model(
     model_description: Annotated[str, Form()],
     model_type: Annotated[SupportedModelType, Form()]
 ):
-    if model_type is SupportedModelType.yolov5_onnx:
+    if model_type is SupportedModelType.yolov5_onnx or model_type is SupportedModelType.yolov8_onnx:
         if not model_file.filename.endswith(".onnx"):
             raise HTTPException(
                 status_code=400,
@@ -290,7 +367,7 @@ async def get_model(
         message = "get all model"
 
     if model is None:
-        raise HTTPException(status_code=200, detail="Model not found")
+        raise HTTPException(status_code=200, detail="model not found")
 
     try:
         return {
@@ -307,14 +384,15 @@ async def get_model(
 async def model(model_id: str, input: UploadFile = File()):
     check_file_type(input)
     # Get model type from database
-    model_type = get_model_type_by_id(model_id)
+    metadata = get_model_by_id(model_id)
 
-    if model_type is None:
+    if metadata is None:
         raise HTTPException(
             status_code=404,
             detail="Model not found in database.")
 
-    if model_type == "yolov5_onnx":
+    type = metadata['model_type']
+    if type == SupportedModelType.yolov5_onnx or type == SupportedModelType.yolov8_onnx:
         model_path = settings.MODEL_DIR + '/' + model_id + '.onnx'
     else:
         model_path = settings.MODEL_DIR + '/' + model_id + '.pt'
@@ -329,18 +407,18 @@ async def model(model_id: str, input: UploadFile = File()):
     output_path = settings.OUTPUT_DIR + '/' + uniqie_id
     if not os.path.exists(output_path):
         os.makedirs(output_path)
-    # Save the image to the output folder
-
     image_path = output_path + '/' + 'original.jpg'
 
     with open(image_path, "wb") as buffer:
         buffer.write(await input.read())
 
     try:
-        model = LoadModel(model_type=model_type, model_id=model_id)
-        model = model.get_model()
-
-        if model_type == SupportedModelType.yolov5_onnx.value or model_type == SupportedModelType.yolov5.value:
+        if type == SupportedModelType.yolov5_onnx or type == SupportedModelType.yolov5:
+            model = torch.hub.load('app\models\yolov5', 'custom',
+                                   path=model_path,
+                                   source='local',
+                                   verbose=False,
+                                   force_reload=True)
             result = model(image_path)
             img_result = create_grid(image_path, result)
             cv2.imwrite(f"{output_path}/result.jpg", img_result)
@@ -352,7 +430,8 @@ async def model(model_id: str, input: UploadFile = File()):
 
             resultData = result.pandas().xyxy[0].value_counts('name').to_dict()
 
-        elif model_type == SupportedModelType.yolov8.value:
+        elif type == SupportedModelType.yolov8 or type == SupportedModelType.yolov8_onnx:
+            model = YOLO(model_path)
             result = model.predict(source=image_path)
             cv2.imwrite(f'{output_path}/result.jpg', result[0].plot())
 
@@ -370,7 +449,8 @@ async def model(model_id: str, input: UploadFile = File()):
                 "post-process": result.speed['postprocess']
             }
 
-        returniddb = insert_result(uniqie_id, model_type, time, resultData)
+        returniddb = insert_result(
+            uniqie_id, type, time, resultData)
 
         if not returniddb.inserted_id:
             raise HTTPException(
@@ -381,7 +461,7 @@ async def model(model_id: str, input: UploadFile = File()):
             "message": f"you can see the result in http://localhost:8000/get_result/{uniqie_id}",
             "data": {
                 "id": str(returniddb.inserted_id),
-                "model": model_type,
+                "model": type,
                 "speed": time,
                 "result": resultData,
             }}
@@ -389,8 +469,71 @@ async def model(model_id: str, input: UploadFile = File()):
         # Delete the output folder if there is an error
         shutil.rmtree(output_path)
         return {"status": "error", "message": str(e)}
-    finally:
-        del model
+
+
+@app.put("/model", tags=["Model Management"])
+async def update_model(
+    model_id: str,
+    model_description: Annotated[str, Form()] = None,
+    model_type: Annotated[SupportedModelType, Form()] = None,
+    model_file: Annotated[UploadFile, File()] = None,
+):
+
+    metadata = get_model_by_id(model_id)
+    if not model:
+        raise HTTPException(
+            status_code=404, detail="Model not found in database")
+
+    if model_type:
+        if not model_file:
+            pass
+        elif model_type is SupportedModelType.yolov5_onnx or model_type is SupportedModelType.yolov8_onnx:
+            if not model_file.filename.endswith(".onnx"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Model is not ONNX")
+        elif model_type is SupportedModelType.yolov5 or model_type is SupportedModelType.yolov8:
+            if not model_file.filename.endswith(".pt"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Model is not PyTorch")
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Model is not supported or it's not match the file extension")
+    else:
+        model_type = metadata['model_type']
+
+    if model_file:
+        _, extension = os.path.splitext(model_file.filename)
+        model_path = settings.MODEL_DIR + '/' + model_id + extension
+
+        os.remove(model_path)
+
+        async with aiofiles.open(model_path, 'wb') as f:
+            while chunk := await model_file.read(CHUNK_SIZE):
+                await f.write(chunk)
+
+    if not model_description:
+        model_description = metadata['model_description']
+
+    try:
+        update_model_by_id(model_id, model_description, model_type)
+        if not get_model_by_id(model_id):
+            raise HTTPException(
+                status_code=500,
+                detail="Error while updating the model in database")
+
+        return {
+            "status": "success",
+            "message": "model updated",
+            "data": {
+                "id": model_id,
+                "description": model_description,
+                "type": model_type}
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @app.delete("/model", tags=["Model Management"])
@@ -398,7 +541,8 @@ async def delete_model(model_id: str):
 
     model = get_model_by_id(model_id)
     if not model:
-        raise HTTPException(status_code=404, detail="Model not found")
+        raise HTTPException(
+            status_code=404, detail="Model not found in database")
 
     model_type = model['model_type']
     model_path = settings.MODEL_DIR + '/' + model_id + '.pt'

@@ -10,6 +10,8 @@ else:
 client = MongoClient(uri)
 db = client[settings.MONGO_INITDB_DATABASE]
 
+print('🚀 Connected to MongoDB...')
+
 Model = db['model']
 Output = db['output']
 
@@ -18,7 +20,7 @@ def insert_result(uniqie_id: str, version: str, time: dict, result: dict):
     return Output.insert_one({
         "_id": uniqie_id,
         "version": version,
-        "LogTime": datetime.datetime.utcnow(),
+        "created_at": datetime.datetime.utcnow(),
         "speed": time,
         "data": result
     })
@@ -34,6 +36,7 @@ def insert_model(uniqie_id: str, model_description: str, model_type: str):
         "model_description": model_description,
         "model_type": model_type,
         "created_at": datetime.datetime.utcnow(),
+        "updated_at": datetime.datetime.utcnow(),
     })
 
 
@@ -42,14 +45,6 @@ def get_all_model():
     for model in Model.find():
         models.append(model)
     return models
-
-
-def get_model_type_by_id(model_id: str):
-    model_metadata = Model.find_one({"_id": model_id})
-    if model_metadata is None:
-        return None
-    else:
-        return model_metadata['model_type']
 
 
 def get_model_by_type(model_type: str):
@@ -61,6 +56,25 @@ def get_model_by_type(model_type: str):
 
 def get_model_by_id(model_id: str):
     return Model.find_one({"_id": model_id})
+
+
+def update_model_by_id(model_id: str, model_description: str, model_type: str):
+    # check if model is updated
+    metadata = Model.find_one({"_id": model_id})
+    Model.update_one({"_id": model_id}, {
+        "$set": {
+            "model_description": model_description,
+            "model_type": model_type,
+            "updated_at": datetime.datetime.utcnow(),
+        }
+    })
+    if metadata is None:
+        return None
+    else:
+        if metadata['model_description'] == model_description and metadata['model_type'] == model_type:
+            return None
+        else:
+            return Model.find_one({"_id": model_id})
 
 
 def delete_model_by_id(model_id: str):
