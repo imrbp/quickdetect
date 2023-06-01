@@ -1,22 +1,26 @@
 import shutil
-from typing import Annotated
+from typing import Annotated, Optional
 import uuid
 import cv2
-from fastapi import FastAPI, UploadFile, File, HTTPException, File, Form, UploadFile
+from fastapi import FastAPI, HTTPException, File, Form, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
+from pydantic import BaseModel
 from app.utils import create_grid
-from .config import settings
-from .database import *
 import os
 from contextlib import asynccontextmanager
+import datetime
 import aiofiles
 import torch
 from ultralytics import YOLO
-
 from enum import Enum
+import beanie
+
+from .database import init_db
+from .config import settings
+from .model import Model
+from .output import Output, Speed, Data
 
 CHUNK_SIZE = 1024 * 1024
-db_model = get_all_model()
 
 ml_models = {}
 
@@ -32,6 +36,7 @@ async def lifespan(app: FastAPI):
                                              source='local', verbose=False)
     ml_models["yolov8"] = YOLO("app\weight\yolov8.pt")
     ml_models["yolov8onnx"] = YOLO("app\weight\yolov8.onnx", task="detect")
+    await init_db()
     yield
     # Clean up the ML models and release the resources
     ml_models.clear()
@@ -57,20 +62,6 @@ def check_file_type(file: UploadFile = File()):
     if not file.content_type.startswith("image/jpg") and not file.content_type.startswith("image/jpeg"):
         raise HTTPException(
             status_code=400, detail="File must be an image (JPG or JPEG format)")
-
-
-# @app.on_event("startup")
-# async def startup_event():
-#     # construct class
-#     global yolov5, yolov5onnx, yolov8, yolov8onnx
-#     yolov5 = torch.hub.load('app\models\yolov5', 'custom',
-#                             path=r'app\weight\yolov5s.pt',
-#                             source='local', verbose=False)
-#     yolov5onnx = torch.hub.load('app\models\yolov5', 'custom',
-#                                 path=r'app\weight\yolov5.onnx',
-#                                 source='local', verbose=False)
-#     yolov8 = YOLO("app\weight\yolov8.pt")
-#     yolov8onnx = YOLO("app\weight\yolov8.onnx", task="detect")
 
 
 @app.get("/")
@@ -104,29 +95,35 @@ async def useyolov5(image_file: UploadFile = File()):
         result = ml_models['yolov5'](image_path)
         img_result = create_grid(image_path, result)
         cv2.imwrite(f"{output_path}/result.jpg", img_result)
-        time = {
-            "pre-process": result.t[0],
-            "interface": result.t[1],
-            "NMS": result.t[2]
-        }
 
-        resultData = result.pandas().xyxy[0].value_counts('name').to_dict()
+        docInsert = Output(
+            id=uniqie_id,
+            model_id="yolov5 by Afin tachiar",
+            model_type="yolov5",
+            created_at=datetime.datetime.utcnow(),
+            speed=Speed(
+                preprocess=result.t[0],
+                interface=result.t[1],
+                postprocess=result.t[2]
+            ),
+            result=Data(
+                detect=result.pandas().xyxy[0].value_counts('name').to_dict())
+        )
+        success = await Output.insert_one(docInsert)
 
-        # Save the result to the database
-        returniddb = insert_result(uniqie_id, "yolov5", time, resultData)
-
-        if not returniddb.inserted_id:
+        if not success:
             raise HTTPException(
                 status_code=500, detail="Error while saving the result to the database")
-
         return {
             "status": "success",
-            "message": f"you can see the result in http://localhost:8000/get_result/{uniqie_id}",
+            "message": f"you can see the result in http://localhost:8000/get_result/{success.id}",
             "data": {
-                "id": str(returniddb.inserted_id),
-                "model": "yolov5",
-                "speed": time,
-                "result": resultData,
+                "id": str(success.id),
+                "model_id": success.model_id,
+                "model_type": success.model_type,
+                "created_at": success.created_at,
+                "speed": success.speed,
+                "result": success.result,
             }}
     except Exception as e:
         # Delete the output folder if there is an error
@@ -153,29 +150,34 @@ async def useyolov5onnx(image_file: UploadFile = File()):
         result = ml_models['yolov5onnx'](image_path)
         img_result = create_grid(image_path, result)
         cv2.imwrite(f"{output_path}/result.jpg", img_result)
-        time = {
-            "pre-process": result.t[0],
-            "interface": result.t[1],
-            "NMS": result.t[2]
-        }
+        docInsert = Output(
+            id=uniqie_id,
+            model_id="yolov5 onnx by Afin tachiar",
+            model_type="yolov5 onnx",
+            created_at=datetime.datetime.utcnow(),
+            speed=Speed(
+                preprocess=result.t[0],
+                interface=result.t[1],
+                postprocess=result.t[2]
+            ),
+            result=Data(
+                detect=result.pandas().xyxy[0].value_counts('name').to_dict())
+        )
+        success = await Output.insert_one(docInsert)
 
-        resultData = result.pandas().xyxy[0].value_counts('name').to_dict()
-
-        # Save the result to the database
-        returniddb = insert_result(uniqie_id, "yolov5", time, resultData)
-
-        if not returniddb.inserted_id:
+        if not success:
             raise HTTPException(
                 status_code=500, detail="Error while saving the result to the database")
-
         return {
             "status": "success",
-            "message": f"you can see the result in http://localhost:8000/get_result/{uniqie_id}",
+            "message": f"you can see the result in http://localhost:8000/get_result/{success.id}",
             "data": {
-                "id": str(returniddb.inserted_id),
-                "model": "yolov5onxx",
-                "speed": time,
-                "result": resultData,
+                "id": str(success.id),
+                "model_id": success.model_id,
+                "model_type": success.model_type,
+                "created_at": success.created_at,
+                "speed": success.speed,
+                "result": success.result,
             }}
     except Exception as e:
         # Delete the output folder if there is an error
@@ -209,26 +211,33 @@ async def useyolov8(image_file: UploadFile = File()):
                 n = (result.boxes.cls == c).sum()
                 resultData[result.names[int(c)]] = int(n)
 
-        time = {
-            "pre-process": result.speed['preprocess'],
-            "inference": result.speed['inference'],
-            "post-process": result.speed['postprocess']
-        }
+        docInsert = Output(
+            id=uniqie_id,
+            model_id="yolov8 onnx by Afin tachiar",
+            model_type="yolov8 onnx",
+            created_at=datetime.datetime.utcnow(),
+            speed=Speed(
+                preprocess=result.speed['preprocess'],
+                interface=result.speed['inference'],
+                postprocess=result.speed['postprocess']
+            ),
+            result=Data(detect=resultData)
+        )
+        success = await Output.insert_one(docInsert)
 
-        returniddb = insert_result(uniqie_id, "yolov8", time, resultData)
-
-        if not returniddb.inserted_id:
+        if not success:
             raise HTTPException(
                 status_code=500, detail="Error while saving the result to the database")
-
         return {
             "status": "success",
-            "message": f"you can see the result in http://localhost:8000/get_result/{uniqie_id}",
+            "message": f"you can see the result in http://localhost:8000/get_result/{success.id}",
             "data": {
-                "id": str(returniddb.inserted_id),
-                "model": "yolov8",
-                "speed": time,
-                "result": resultData,
+                "id": str(success.id),
+                "model_id": success.model_id,
+                "model_type": success.model_type,
+                "created_at": success.created_at,
+                "speed": success.speed,
+                "result": success.result,
             }}
     except Exception as e:
         # Delete the output folder if there is an error
@@ -262,26 +271,33 @@ async def useyolov8onnx(image_file: UploadFile = File()):
                 n = (result.boxes.cls == c).sum()
                 resultData[result.names[int(c)]] = int(n)
 
-        time = {
-            "pre-process": result.speed['preprocess'],
-            "inference": result.speed['inference'],
-            "post-process": result.speed['postprocess']
-        }
+        docInsert = Output(
+            id=uniqie_id,
+            model_id="yolov8 onnx by Afin tachiar",
+            model_type="yolov8 onnx",
+            created_at=datetime.datetime.utcnow(),
+            speed=Speed(
+                preprocess=result.speed['preprocess'],
+                interface=result.speed['inference'],
+                postprocess=result.speed['postprocess']
+            ),
+            result=Data(detect=resultData)
+        )
+        success = await Output.insert_one(docInsert)
 
-        returniddb = insert_result(uniqie_id, "yolov8", time, resultData)
-
-        if not returniddb.inserted_id:
+        if not success:
             raise HTTPException(
                 status_code=500, detail="Error while saving the result to the database")
-
         return {
             "status": "success",
-            "message": f"you can see the result in http://localhost:8000/get_result/{uniqie_id}",
+            "message": f"you can see the result in http://localhost:8000/get_result/{success.id}",
             "data": {
-                "id": str(returniddb.inserted_id),
-                "model": "yolov8",
-                "speed": time,
-                "result": resultData,
+                "id": str(success.id),
+                "model_id": success.model_id,
+                "model_type": success.model_type,
+                "created_at": success.created_at,
+                "speed": success.speed,
+                "result": success.result,
             }}
     except Exception as e:
         # Delete the output folder if there is an error
@@ -297,12 +313,12 @@ async def upload_model(
     model_description: Annotated[str, Form()],
     model_type: Annotated[SupportedModelType, Form()]
 ):
-    if model_type is SupportedModelType.yolov5_onnx or model_type is SupportedModelType.yolov8_onnx:
+    if model_type == SupportedModelType.yolov5_onnx or model_type == SupportedModelType.yolov8_onnx:
         if not model_file.filename.endswith(".onnx"):
             raise HTTPException(
                 status_code=400,
                 detail="Model is not ONNX")
-    elif model_type is SupportedModelType.yolov5 or model_type is SupportedModelType.yolov8:
+    elif model_type == SupportedModelType.yolov5 or model_type == SupportedModelType.yolov8:
         if not model_file.filename.endswith(".pt"):
             raise HTTPException(
                 status_code=400,
@@ -326,20 +342,29 @@ async def upload_model(
         while chunk := await model_file.read(CHUNK_SIZE):
             await f.write(chunk)
     try:
-        returniddb = insert_model(
-            unique_id, model_description, model_type.value)
+        docInsert = Model(
+            id=unique_id,
+            description=model_description,
+            type=model_type.value,
+            created_at=datetime.datetime.utcnow(),
+            updated_at=datetime.datetime.utcnow(),
+        )
 
-        if not returniddb.inserted_id:
+        succces = await Model.insert_one(docInsert)
+
+        if not succces:
             raise HTTPException(
-                status_code=500, detail="Error while saving the result to the database")
+                status_code=500, detail="Error while saving the model metadata to the database")
 
         return {
             "status": "success",
             "message": "model uploaded",
             "data": {
-                "id": str(returniddb.inserted_id),
-                "description": model_description,
-                "type": model_type.value}
+                "id": str(succces.id),
+                "description": succces.description,
+                "type": succces.type,
+                "created_at": succces.created_at,
+            },
         }
     except Exception as e:
         # remove file if there is an error
@@ -347,23 +372,29 @@ async def upload_model(
         return {"status": "error", "message": str(e)}
 
 
+class ModelView(BaseModel):
+    id: str = Optional[None]
+    description: str = Optional[None]
+    type: str = Optional[None]
+
+
 @app.get("/model",
          description="""
                 Get model by id or type
                 """,
-         tags=["Model Management"])
+         tags=["Model Management"],)
 async def get_model(
         model_id: str = None,
         model_type: Annotated[SupportedModelType, None] = None):
 
     if model_id is not None and model_type is None:
-        model = get_model_by_id(model_id)
-        message = "get model by id :" + model_id
+        model = await Model.get(model_id)
+        message = "get model by id : " + model_id
     elif model_type:
-        model = get_model_by_type(model_type)
+        model = await Model.find(Model.type == model_type).to_list()
         message = "get model by type : " + model_type.value
     else:
-        model = get_all_model()
+        model = await Model.find({}).to_list()
         message = "get all model"
 
     if model is None:
@@ -384,15 +415,14 @@ async def get_model(
 async def model(model_id: str, input: UploadFile = File()):
     check_file_type(input)
     # Get model type from database
-    metadata = get_model_by_id(model_id)
+    metadata = await Model.get(model_id)
 
     if metadata is None:
         raise HTTPException(
             status_code=404,
             detail="Model not found in database.")
 
-    type = metadata['model_type']
-    if type == SupportedModelType.yolov5_onnx or type == SupportedModelType.yolov8_onnx:
+    if metadata.type == SupportedModelType.yolov5_onnx or metadata.type == SupportedModelType.yolov8_onnx:
         model_path = settings.MODEL_DIR + '/' + model_id + '.onnx'
     else:
         model_path = settings.MODEL_DIR + '/' + model_id + '.pt'
@@ -413,7 +443,7 @@ async def model(model_id: str, input: UploadFile = File()):
         buffer.write(await input.read())
 
     try:
-        if type == SupportedModelType.yolov5_onnx or type == SupportedModelType.yolov5:
+        if metadata.type == SupportedModelType.yolov5_onnx or metadata.type == SupportedModelType.yolov5:
             model = torch.hub.load('app\models\yolov5', 'custom',
                                    path=model_path,
                                    source='local',
@@ -422,15 +452,21 @@ async def model(model_id: str, input: UploadFile = File()):
             result = model(image_path)
             img_result = create_grid(image_path, result)
             cv2.imwrite(f"{output_path}/result.jpg", img_result)
-            time = {
-                "pre-process": result.t[0],
-                "interface": result.t[1],
-                "NMS": result.t[2]
-            }
+            docInsert = Output(
+                id=uniqie_id,
+                model_id=str(metadata.id),
+                model_type=metadata.type,
+                created_at=datetime.datetime.utcnow(),
+                speed=Speed(
+                    preprocess=result.t[0],
+                    interface=result.t[1],
+                    postprocess=result.t[2]
+                ),
+                result=Data(
+                    detect=result.pandas().xyxy[0].value_counts('name').to_dict())
+            )
 
-            resultData = result.pandas().xyxy[0].value_counts('name').to_dict()
-
-        elif type == SupportedModelType.yolov8 or type == SupportedModelType.yolov8_onnx:
+        elif metadata.type == SupportedModelType.yolov8 or metadata.type == SupportedModelType.yolov8_onnx:
             model = YOLO(model_path)
             result = model.predict(source=image_path)
             cv2.imwrite(f'{output_path}/result.jpg', result[0].plot())
@@ -443,27 +479,34 @@ async def model(model_id: str, input: UploadFile = File()):
                     n = (result.boxes.cls == c).sum()
                     resultData[result.names[int(c)]] = int(n)
 
-            time = {
-                "pre-process": result.speed['preprocess'],
-                "inference": result.speed['inference'],
-                "post-process": result.speed['postprocess']
-            }
+            docInsert = Output(
+                id=uniqie_id,
+                model_id=str(metadata.id),
+                model_type=metadata.type,
+                created_at=datetime.datetime.utcnow(),
+                speed=Speed(
+                    preprocess=result.speed['preprocess'],
+                    interface=result.speed['inference'],
+                    postprocess=result.speed['postprocess']
+                ),
+                result=Data(detect=resultData)
+            )
 
-        returniddb = insert_result(
-            uniqie_id, type, time, resultData)
+        success = await Output.insert_one(docInsert)
 
-        if not returniddb.inserted_id:
+        if not success:
             raise HTTPException(
                 status_code=500, detail="Error while saving the result to the database")
-
         return {
             "status": "success",
-            "message": f"you can see the result in http://localhost:8000/get_result/{uniqie_id}",
+            "message": f"you can see the result in http://localhost:8000/get_result/{success.id}",
             "data": {
-                "id": str(returniddb.inserted_id),
-                "model": type,
-                "speed": time,
-                "result": resultData,
+                "id": str(success.id),
+                "model_id": success.model_id,
+                "model_type": success.model_type,
+                "created_at": success.created_at,
+                "speed": success.speed,
+                "result": success.result,
             }}
     except Exception as e:
         # Delete the output folder if there is an error
@@ -478,60 +521,87 @@ async def update_model(
     model_type: Annotated[SupportedModelType, Form()] = None,
     model_file: Annotated[UploadFile, File()] = None,
 ):
-
-    metadata = get_model_by_id(model_id)
-    if not model:
+    metadata = await Model.get(model_id)
+    if not metadata:
         raise HTTPException(
             status_code=404, detail="Model not found in database")
 
-    if model_type:
-        if not model_file:
-            pass
-        elif model_type is SupportedModelType.yolov5_onnx or model_type is SupportedModelType.yolov8_onnx:
+    if model_type is None and model_file is None and model_description is None and metadata is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Model found in database, But nothing to Update. Please provide at least one field to update.")
+
+    model_path = f"{settings.MODEL_DIR}/{model_id}.pt"
+    if metadata.type == SupportedModelType.yolov5_onnx or metadata.type == SupportedModelType.yolov8_onnx:
+        model_path = f"{settings.MODEL_DIR}/{model_id}.onnx"
+
+    if not os.path.isfile(model_path) and metadata is not None:
+        raise HTTPException(
+            status_code=500,
+            detail="Model File not found in server, But found in database. Please upload the model file and choose the model type")
+
+    if model_type is not None and model_type != metadata.type:
+        if model_file is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Model type is different with the model in the server. Please upload the model file and choose the model type")
+
+        if model_type == SupportedModelType.yolov5_onnx or model_type == SupportedModelType.yolov8_onnx:
             if not model_file.filename.endswith(".onnx"):
                 raise HTTPException(
                     status_code=400,
-                    detail="Model is not ONNX")
-        elif model_type is SupportedModelType.yolov5 or model_type is SupportedModelType.yolov8:
+                    detail="Model Uploaded is not ONNX")
+        elif model_type == SupportedModelType.yolov5 or model_type == SupportedModelType.yolov8:
             if not model_file.filename.endswith(".pt"):
                 raise HTTPException(
                     status_code=400,
-                    detail="Model is not PyTorch")
+                    detail="Model Uploaded is not PyTorch")
         else:
             raise HTTPException(
                 status_code=400,
                 detail="Model is not supported or it's not match the file extension")
-    else:
-        model_type = metadata['model_type']
 
-    if model_file:
+    if model_file is not None and model_type is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Model Uploaded is provided but model type is not. Please choose the model type")
+
+    if model_description is not None:
+        metadata.description = model_description
+
+    if model_type is not None and model_file is not None:
         _, extension = os.path.splitext(model_file.filename)
+
+        # remove old model
+        if os.path.isfile(model_path):
+            os.remove(model_path)
+
         model_path = settings.MODEL_DIR + '/' + model_id + extension
 
-        os.remove(model_path)
+        # IF TO LARGE check Reverse Proxy
+        # https://fastapi.tiangolo.com/advanced/behind-a-proxy/
 
         async with aiofiles.open(model_path, 'wb') as f:
             while chunk := await model_file.read(CHUNK_SIZE):
                 await f.write(chunk)
 
-    if not model_description:
-        model_description = metadata['model_description']
+        metadata.type = model_type.value
 
     try:
-        update_model_by_id(model_id, model_description, model_type)
-        if not get_model_by_id(model_id):
-            raise HTTPException(
-                status_code=500,
-                detail="Error while updating the model in database")
+        metadata.updated_at = datetime.datetime.utcnow()
+        await metadata.replace()
 
         return {
             "status": "success",
-            "message": "model updated",
+            "message": f"model updated at {metadata.updated_at}",
             "data": {
-                "id": model_id,
-                "description": model_description,
-                "type": model_type}
+                "id": metadata.id,
+                "description": metadata.description,
+                "type": metadata.type, }
         }
+    except (ValueError, beanie.exceptions.DocumentNotFound):
+        raise HTTPException(
+            status_code=404, detail="Model not found in database")
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -539,24 +609,22 @@ async def update_model(
 @app.delete("/model", tags=["Model Management"])
 async def delete_model(model_id: str):
 
-    model = get_model_by_id(model_id)
-    if not model:
+    metadata = await Model.get(model_id)
+    if not metadata:
         raise HTTPException(
             status_code=404, detail="Model not found in database")
 
-    model_type = model['model_type']
-    model_path = settings.MODEL_DIR + '/' + model_id + '.pt'
-    if model_type == SupportedModelType.yolov5_onnx.value:
-        model_path = settings.MODEL_DIR + '/' + model_id + '.onnx'
+    model_path = f"{settings.MODEL_DIR}/{model_id}.pt"
+    if metadata.type == SupportedModelType.yolov5_onnx or metadata.type == SupportedModelType.yolov8_onnx:
+        model_path = f"{settings.MODEL_DIR}/{model_id}.onnx"
 
     if not os.path.isfile(model_path):
         raise HTTPException(
             status_code=500,
             detail="Model File not found")
     try:
-
-        delete_model_by_id(model_id)
-        if get_model_by_id(model_id):
+        await metadata.delete()
+        if await Model.get(model_id):
             raise HTTPException(
                 status_code=500,
                 detail="Error while deleting the model in database")
@@ -565,17 +633,18 @@ async def delete_model(model_id: str):
 
         return {
             "status": "success",
-            "message": "model deleted",
-            "data": model
+            "message": f"model deleted : " + model_id,
+            "data": {
+                "id": metadata.id,
+                "description": metadata.description,
+                "type": metadata.type, }
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
 @app.get("/get_image", tags=["Get Result"])
-def get_image(unique_id: str):
-    if unique_id:
-        HTTPException(status_code=404, detail="unique id is required")
+async def get_image(unique_id: str):
     if not os.path.exists(f"{settings.OUTPUT_DIR}/{unique_id}"):
         raise HTTPException(
             status_code=500, detail="file not found. either the unique id is wrong or the model is not yet finished processing the image")
@@ -587,15 +656,22 @@ def get_image(unique_id: str):
 
 
 @app.get("/get_data", tags=["Get Result"])
-def get_result(unique_id: str):
-    if unique_id:
-        HTTPException(status_code=404, detail="unique id is required")
-    result = get_result_by_id(unique_id)
-    if not result:
-        raise HTTPException(
-            status_code=500, detail="result not found. either the unique id is wrong or the model is not yet finished processing the image")
+async def get_result(unique_id: str):
     try:
-        return result
+        result = await Output.get(unique_id)
+        if not result:
+            raise HTTPException(
+                status_code=500, detail="result not found. either the unique id is wrong or the model is not yet finished processing the image")
+        return {
+            "status": "success",
+            "data": {
+                "id": str(result.id),
+                "model_id": result.model_id,
+                "model_type": result.model_type,
+                "created_at": result.created_at,
+                "speed": result.speed,
+                "result": result.result,
+            }}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
