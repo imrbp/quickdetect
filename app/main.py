@@ -27,7 +27,7 @@ ml_models = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Load the ML model
+    # Memuat Model
     ml_models["yolov5"] = torch.hub.load('app\models\yolov5', 'custom',
                                          path=r'app\weight\yolov5s.pt',
                                          source='local', verbose=False)
@@ -36,9 +36,10 @@ async def lifespan(app: FastAPI):
                                              source='local', verbose=False)
     ml_models["yolov8"] = YOLO("app\weight\yolov8.pt")
     ml_models["yolov8onnx"] = YOLO("app\weight\yolov8.onnx", task="detect")
+    # Inisialisasi Database
     await init_db()
     yield
-    # Clean up the ML models and release the resources
+    # Hapus Model
     ml_models.clear()
 
 
@@ -397,9 +398,6 @@ async def get_model(
         model = await Model.find({}).to_list()
         message = "get all model"
 
-    if model is None:
-        raise HTTPException(status_code=200, detail="model not found")
-
     try:
         return {
             "status": "success",
@@ -429,7 +427,7 @@ async def model(model_id: str, input: UploadFile = File()):
 
     if not os.path.isfile(model_path):
         raise HTTPException(
-            status_code=500,
+            status_code=404,
             detail="Model not found in server.")
 
     uniqie_id = str(uuid.uuid1())
@@ -537,13 +535,13 @@ async def update_model(
 
     if not os.path.isfile(model_path) and metadata is not None:
         raise HTTPException(
-            status_code=500,
+            status_code=404,
             detail="Model File not found in server, But found in database. Please upload the model file and choose the model type")
 
     if model_type is not None and model_type != metadata.type:
         if model_file is None:
             raise HTTPException(
-                status_code=400,
+                status_code=404,
                 detail="Model type is different with the model in the server. Please upload the model file and choose the model type")
 
         if model_type == SupportedModelType.yolov5_onnx or model_type == SupportedModelType.yolov8_onnx:
@@ -620,8 +618,8 @@ async def delete_model(model_id: str):
 
     if not os.path.isfile(model_path):
         raise HTTPException(
-            status_code=500,
-            detail="Model File not found")
+            status_code=404,
+            detail="Model File not found in the server")
     try:
         await metadata.delete()
         if await Model.get(model_id):
@@ -647,7 +645,7 @@ async def delete_model(model_id: str):
 async def get_image(unique_id: str):
     if not os.path.exists(f"{settings.OUTPUT_DIR}/{unique_id}"):
         raise HTTPException(
-            status_code=500, detail="file not found. either the unique id is wrong or the model is not yet finished processing the image")
+            status_code=404, detail="file not found. either the unique id is wrong or the model is not yet finished processing the image")
     try:
         file = f"{settings.OUTPUT_DIR}/{unique_id}/result.jpg"
         return FileResponse(file)
@@ -661,7 +659,7 @@ async def get_result(unique_id: str):
         result = await Output.get(unique_id)
         if not result:
             raise HTTPException(
-                status_code=500, detail="result not found. either the unique id is wrong or the model is not yet finished processing the image")
+                status_code=404, detail="result not found. either the unique id is wrong or the model is not yet finished processing the image")
         return {
             "status": "success",
             "data": {
