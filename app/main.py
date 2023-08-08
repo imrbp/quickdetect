@@ -1,24 +1,28 @@
+from asyncio import sleep
+from .output import Output, Speed, Data
+from .model import Model
+from .config import settings
+from .database import init_db
+import beanie
+from enum import Enum
+from ultralytics import YOLO
+import torch
+import aiofiles
+from contextlib import asynccontextmanager
+import os
+from app.utils import create_grid
+from pydantic import BaseModel
+from fastapi.responses import FileResponse, HTMLResponse
+import datetime
+from datetime import timedelta
 import shutil
 from typing import Annotated, Optional
 import uuid
 import cv2
 from fastapi import FastAPI, HTTPException, File, Form, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
-from app.utils import create_grid
-import os
-from contextlib import asynccontextmanager
-import datetime
-import aiofiles
-import torch
-from ultralytics import YOLO
-from enum import Enum
-import beanie
+import logging
 
-from .database import init_db
-from .config import settings
-from .model import Model
-from .output import Output, Speed, Data
+from fastapi.middleware.cors import CORSMiddleware
 
 CHUNK_SIZE = 1024 * 1024
 
@@ -29,13 +33,13 @@ ml_models = {}
 async def lifespan(app: FastAPI):
     # Memuat Model
     ml_models["yolov5"] = torch.hub.load('app\models\yolov5', 'custom',
-                                         path=r'app\weight\yolov5s.pt',
+                                         path=r'app\weight\yolov5lafin.pt',
                                          source='local', verbose=False)
     ml_models["yolov5onnx"] = torch.hub.load('app\models\yolov5', 'custom',
-                                             path=r'app\weight\yolov5.onnx',
+                                             path=r'app\weight\yolov5lafin.onnx',
                                              source='local', verbose=False)
-    ml_models["yolov8"] = YOLO("app\weight\yolov8.pt")
-    ml_models["yolov8onnx"] = YOLO("app\weight\yolov8.onnx", task="detect")
+    ml_models["yolov8"] = YOLO("app\weight\yolov8afin.pt")
+    ml_models["yolov8onnx"] = YOLO("app\weight\yolov8afin.onnx", task="detect")
     # Inisialisasi Database
     await init_db()
     yield
@@ -43,18 +47,32 @@ async def lifespan(app: FastAPI):
     ml_models.clear()
 
 
+origins = [
+    "http://localhost:3000",
+    "localhost:3000"
+]
+
+
 app = FastAPI(
     title="Quick Detect",
     description="""
     G64190075.
-    Detection Only and Input must Image.
-    Classification and Segmentation are not supported.
-    Supported model: 
-        - yolov5 (pyTorch and Onnx)
-        - yolov8 (pyTorch Only)
-    Supported image format: JPG and JPEG
+    Hanya dapat mendeteksi citra.
+    Model yang didukung: 
+        - yolov5 (pyTorch and ONNX)
+        - yolov8 (pyTorch dan ONNX)
+    Format Citra yang didukung :
+        - JPG atau JPEG
     """,
     lifespan=lifespan
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
 )
 
 
@@ -77,7 +95,7 @@ class SupportedModelType(str, Enum):
     yolov8_onnx = "yolov8_onnx"
 
 
-@app.post("/yolov5", tags=["Predict How Many Trees in the picture"])
+@app.post("/detect/yolov5", tags=["Predict How Many Trees in the picture"])
 async def useyolov5(image_file: UploadFile = File()):
     check_file_type(image_file)
 
@@ -94,45 +112,48 @@ async def useyolov5(image_file: UploadFile = File()):
 
     try:
         result = ml_models['yolov5'](image_path)
-        img_result = create_grid(image_path, result)
-        cv2.imwrite(f"{output_path}/result.jpg", img_result)
-
-        docInsert = Output(
-            id=uniqie_id,
-            model_id="yolov5 by Afin tachiar",
-            model_type="yolov5",
-            created_at=datetime.datetime.utcnow(),
-            speed=Speed(
-                preprocess=result.t[0],
-                interface=result.t[1],
-                postprocess=result.t[2]
-            ),
-            result=Data(
-                detect=result.pandas().xyxy[0].value_counts('name').to_dict())
-        )
-        success = await Output.insert_one(docInsert)
-
-        if not success:
-            raise HTTPException(
-                status_code=500, detail="Error while saving the result to the database")
-        return {
-            "status": "success",
-            "message": f"you can see the result in http://localhost:8000/get_result/{success.id}",
-            "data": {
-                "id": str(success.id),
-                "model_id": success.model_id,
-                "model_type": success.model_type,
-                "created_at": success.created_at,
-                "speed": success.speed,
-                "result": success.result,
-            }}
     except Exception as e:
-        # Delete the output folder if there is an error
         shutil.rmtree(output_path)
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(
+            status_code=400, detail=f"Error when running the model.\n {str(e)}")
+
+    img_result = create_grid(image_path, result)
+    cv2.imwrite(f"{output_path}/result.jpg", img_result)
+
+    docInsert = Output(
+        id=uniqie_id,
+        model_id="yolov5 by Afin tachiar",
+        model_type="yolov5",
+        created_at=datetime.datetime.utcnow(),
+        speed=Speed(
+            preprocess=result.t[0],
+            interface=result.t[1],
+            postprocess=result.t[2]
+        ),
+        result=Data(
+            detect=result.pandas().xyxy[0].value_counts('name').to_dict())
+    )
+    success = await Output.insert_one(docInsert)
+
+    if not success:
+        shutil.rmtree(output_path)
+        raise HTTPException(
+            status_code=500, detail="Error while saving the result to the database")
+
+    return {
+        "status": "success",
+        "message": f"URI to get the result http://localhost:8000/result?unique_id={success.id}",
+        "data": {
+            "id": str(success.id),
+            "model_id": success.model_id,
+            "model_type": success.model_type,
+            "created_at": success.created_at,
+            "speed": success.speed,
+            "result": success.result,
+        }}
 
 
-@app.post("/yolov5onnx", tags=["Predict How Many Trees in the picture"])
+@app.post("/detect/yolov5onnx", tags=["Predict How Many Trees in the picture"])
 async def useyolov5onnx(image_file: UploadFile = File()):
     check_file_type(image_file)
 
@@ -149,44 +170,45 @@ async def useyolov5onnx(image_file: UploadFile = File()):
 
     try:
         result = ml_models['yolov5onnx'](image_path)
-        img_result = create_grid(image_path, result)
-        cv2.imwrite(f"{output_path}/result.jpg", img_result)
-        docInsert = Output(
-            id=uniqie_id,
-            model_id="yolov5 onnx by Afin tachiar",
-            model_type="yolov5 onnx",
-            created_at=datetime.datetime.utcnow(),
-            speed=Speed(
-                preprocess=result.t[0],
-                interface=result.t[1],
-                postprocess=result.t[2]
-            ),
-            result=Data(
-                detect=result.pandas().xyxy[0].value_counts('name').to_dict())
-        )
-        success = await Output.insert_one(docInsert)
-
-        if not success:
-            raise HTTPException(
-                status_code=500, detail="Error while saving the result to the database")
-        return {
-            "status": "success",
-            "message": f"you can see the result in http://localhost:8000/get_result/{success.id}",
-            "data": {
-                "id": str(success.id),
-                "model_id": success.model_id,
-                "model_type": success.model_type,
-                "created_at": success.created_at,
-                "speed": success.speed,
-                "result": success.result,
-            }}
     except Exception as e:
-        # Delete the output folder if there is an error
         shutil.rmtree(output_path)
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(
+            status_code=400, detail=f"Error when running the model.\n {str(e)}")
+
+    img_result = create_grid(image_path, result)
+    cv2.imwrite(f"{output_path}/result.jpg", img_result)
+    docInsert = Output(
+        id=uniqie_id,
+        model_id="yolov5 onnx by Afin tachiar",
+        model_type="yolov5 onnx",
+        created_at=datetime.datetime.utcnow(),
+        speed=Speed(
+            preprocess=result.t[0],
+            interface=result.t[1],
+            postprocess=result.t[2]
+        ),
+        result=Data(
+            detect=result.pandas().xyxy[0].value_counts('name').to_dict())
+    )
+    success = await Output.insert_one(docInsert)
+    if not success:
+        shutil.rmtree(output_path)
+        raise HTTPException(
+            status_code=500, detail="Error while saving the result to the database")
+    return {
+        "status": "success",
+        "message": f"URI to get the result http://localhost:8000/result?unique_id={success.id}",
+        "data": {
+            "id": str(success.id),
+            "model_id": success.model_id,
+            "model_type": success.model_type,
+            "created_at": success.created_at,
+            "speed": success.speed,
+            "result": success.result,
+        }}
 
 
-@app.post("/yolov8", tags=["Predict How Many Trees in the picture"])
+@app.post("/detect/yolov8", tags=["Predict How Many Trees in the picture"])
 async def useyolov8(image_file: UploadFile = File()):
     check_file_type(image_file)
 
@@ -203,50 +225,50 @@ async def useyolov8(image_file: UploadFile = File()):
 
     try:
         result = ml_models['yolov8'](image_path)
-        cv2.imwrite(f'{output_path}/result.jpg', result[0].plot())
-        result = result[0]
-
-        resultData = {}
-        if result.boxes:
-            for c in result.boxes.cls.unique():
-                n = (result.boxes.cls == c).sum()
-                resultData[result.names[int(c)]] = int(n)
-
-        docInsert = Output(
-            id=uniqie_id,
-            model_id="yolov8 onnx by Afin tachiar",
-            model_type="yolov8 onnx",
-            created_at=datetime.datetime.utcnow(),
-            speed=Speed(
-                preprocess=result.speed['preprocess'],
-                interface=result.speed['inference'],
-                postprocess=result.speed['postprocess']
-            ),
-            result=Data(detect=resultData)
-        )
-        success = await Output.insert_one(docInsert)
-
-        if not success:
-            raise HTTPException(
-                status_code=500, detail="Error while saving the result to the database")
-        return {
-            "status": "success",
-            "message": f"you can see the result in http://localhost:8000/get_result/{success.id}",
-            "data": {
-                "id": str(success.id),
-                "model_id": success.model_id,
-                "model_type": success.model_type,
-                "created_at": success.created_at,
-                "speed": success.speed,
-                "result": success.result,
-            }}
     except Exception as e:
-        # Delete the output folder if there is an error
         shutil.rmtree(output_path)
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(
+            status_code=400, detail=f"Error when running the model.\n {str(e)}")
+
+    cv2.imwrite(f'{output_path}/result.jpg', result[0].plot())
+    result = result[0]
+    resultData = {}
+    if result.boxes:
+        for c in result.boxes.cls.unique():
+            n = (result.boxes.cls == c).sum()
+            resultData[result.names[int(c)]] = int(n)
+    docInsert = Output(
+        id=uniqie_id,
+        model_id="yolov8 onnx by Afin tachiar",
+        model_type="yolov8 onnx",
+        created_at=datetime.datetime.utcnow(),
+        speed=Speed(
+            preprocess=result.speed['preprocess'],
+            interface=result.speed['inference'],
+            postprocess=result.speed['postprocess']
+        ),
+        result=Data(detect=resultData)
+    )
+    success = await Output.insert_one(docInsert)
+    if not success:
+        shutil.rmtree(output_path)
+        raise HTTPException(
+            status_code=500, detail="Error while saving the result to the database")
+    return {
+        "status": "success",
+        "message": f"URI to get the result http://localhost:8000/result?unique_id={success.id}",
+        "data": {
+            "id": str(success.id),
+            "model_id": success.model_id,
+            "model_type": success.model_type,
+            "created_at": success.created_at,
+            "speed": success.speed,
+            "result": success.result,
+        }
+    }
 
 
-@app.post("/yolov8onnx", tags=["Predict How Many Trees in the picture"])
+@app.post("/detect/yolov8onnx", tags=["Predict How Many Trees in the picture"])
 async def useyolov8onnx(image_file: UploadFile = File()):
     check_file_type(image_file)
 
@@ -263,50 +285,49 @@ async def useyolov8onnx(image_file: UploadFile = File()):
 
     try:
         result = ml_models['yolov8onnx'](image_path)
-        cv2.imwrite(f'{output_path}/result.jpg', result[0].plot())
-        result = result[0]
-
-        resultData = {}
-        if result.boxes:
-            for c in result.boxes.cls.unique():
-                n = (result.boxes.cls == c).sum()
-                resultData[result.names[int(c)]] = int(n)
-
-        docInsert = Output(
-            id=uniqie_id,
-            model_id="yolov8 onnx by Afin tachiar",
-            model_type="yolov8 onnx",
-            created_at=datetime.datetime.utcnow(),
-            speed=Speed(
-                preprocess=result.speed['preprocess'],
-                interface=result.speed['inference'],
-                postprocess=result.speed['postprocess']
-            ),
-            result=Data(detect=resultData)
-        )
-        success = await Output.insert_one(docInsert)
-
-        if not success:
-            raise HTTPException(
-                status_code=500, detail="Error while saving the result to the database")
-        return {
-            "status": "success",
-            "message": f"you can see the result in http://localhost:8000/get_result/{success.id}",
-            "data": {
-                "id": str(success.id),
-                "model_id": success.model_id,
-                "model_type": success.model_type,
-                "created_at": success.created_at,
-                "speed": success.speed,
-                "result": success.result,
-            }}
     except Exception as e:
-        # Delete the output folder if there is an error
         shutil.rmtree(output_path)
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(
+            status_code=400, detail=f"Error when running the model.\n {str(e)}")
+
+    cv2.imwrite(f'{output_path}/result.jpg', result[0].plot())
+    result = result[0]
+    resultData = {}
+    if result.boxes:
+        for c in result.boxes.cls.unique():
+            n = (result.boxes.cls == c).sum()
+            resultData[result.names[int(c)]] = int(n)
+    docInsert = Output(
+        id=uniqie_id,
+        model_id="yolov8 onnx by Afin tachiar",
+        model_type="yolov8 onnx",
+        created_at=datetime.datetime.utcnow(),
+        speed=Speed(
+            preprocess=result.speed['preprocess'],
+            interface=result.speed['inference'],
+            postprocess=result.speed['postprocess']
+        ),
+        result=Data(detect=resultData)
+    )
+    success = await Output.insert_one(docInsert)
+    if not success:
+        shutil.rmtree(output_path)
+        raise HTTPException(
+            status_code=500, detail="Error while saving the result to the database")
+    return {
+        "status": "success",
+        "message": f"URI to get the result http://localhost:8000/result?unique_id={success.id}",
+        "data": {
+            "id": str(success.id),
+            "model_id": success.model_id,
+            "model_type": success.model_type,
+            "created_at": success.created_at,
+            "speed": success.speed,
+            "result": success.result,
+        }}
 
 
-@app.post("/upload_model",
+@app.post("/model",
           description=f"Upload model to server",
           tags=["Model Management"])
 async def upload_model(
@@ -342,41 +363,29 @@ async def upload_model(
     async with aiofiles.open(model_path, 'wb') as f:
         while chunk := await model_file.read(CHUNK_SIZE):
             await f.write(chunk)
-    try:
-        docInsert = Model(
-            id=unique_id,
-            description=model_description,
-            type=model_type.value,
-            created_at=datetime.datetime.utcnow(),
-            updated_at=datetime.datetime.utcnow(),
-        )
 
-        succces = await Model.insert_one(docInsert)
-
-        if not succces:
-            raise HTTPException(
-                status_code=500, detail="Error while saving the model metadata to the database")
-
-        return {
-            "status": "success",
-            "message": "model uploaded",
-            "data": {
-                "id": str(succces.id),
-                "description": succces.description,
-                "type": succces.type,
-                "created_at": succces.created_at,
-            },
-        }
-    except Exception as e:
-        # remove file if there is an error
-        os.remove(model_path)
-        return {"status": "error", "message": str(e)}
-
-
-class ModelView(BaseModel):
-    id: str = Optional[None]
-    description: str = Optional[None]
-    type: str = Optional[None]
+    docInsert = Model(
+        id=unique_id,
+        description=model_description,
+        type=model_type.value,
+        created_at=datetime.datetime.utcnow(),
+        updated_at=datetime.datetime.utcnow(),
+    )
+    succces = await Model.insert_one(docInsert)
+    if not succces:
+        shutil.rmtree(model_path)
+        raise HTTPException(
+            status_code=500, detail="Error while saving the model metadata to the database")
+    return {
+        "status": "success",
+        "message": "model uploaded",
+        "data": {
+            "id": str(succces.id),
+            "description": succces.description,
+            "type": succces.type,
+            "created_at": succces.created_at,
+        },
+    }
 
 
 @app.get("/model",
@@ -389,6 +398,11 @@ async def get_model(
         model_type: Annotated[SupportedModelType, None] = None):
 
     if model_id is not None and model_type is None:
+        try:
+            uuid_obj = uuid.UUID(model_id, version=1)
+        except ValueError:
+            raise HTTPException(
+                status_code=400, detail="unique id is not valid")
         model = await Model.get(model_id)
         message = "get model by id : " + model_id
     elif model_type:
@@ -398,20 +412,24 @@ async def get_model(
         model = await Model.find({}).to_list()
         message = "get all model"
 
-    try:
-        return {
-            "status": "success",
-            "message": message,
-            "data": model
-        }
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    return {
+        "status": "success",
+        "message": message,
+        "data": model
+    }
 
 
-@app.post("/model",
+@app.post("/detect",
           tags=["Model Management"])
-async def model(model_id: str, input: UploadFile = File()):
-    check_file_type(input)
+async def model(model_id: str, image_file: UploadFile = File()):
+
+    try:
+        uuid_obj = uuid.UUID(model_id, version=1)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="unique id is not valid")
+
+    check_file_type(image_file)
     # Get model type from database
     metadata = await Model.get(model_id)
 
@@ -438,7 +456,7 @@ async def model(model_id: str, input: UploadFile = File()):
     image_path = output_path + '/' + 'original.jpg'
 
     with open(image_path, "wb") as buffer:
-        buffer.write(await input.read())
+        buffer.write(await image_file.read())
 
     try:
         if metadata.type == SupportedModelType.yolov5_onnx or metadata.type == SupportedModelType.yolov5:
@@ -490,26 +508,28 @@ async def model(model_id: str, input: UploadFile = File()):
                 result=Data(detect=resultData)
             )
 
-        success = await Output.insert_one(docInsert)
-
-        if not success:
-            raise HTTPException(
-                status_code=500, detail="Error while saving the result to the database")
-        return {
-            "status": "success",
-            "message": f"you can see the result in http://localhost:8000/get_result/{success.id}",
-            "data": {
-                "id": str(success.id),
-                "model_id": success.model_id,
-                "model_type": success.model_type,
-                "created_at": success.created_at,
-                "speed": success.speed,
-                "result": success.result,
-            }}
     except Exception as e:
         # Delete the output folder if there is an error
         shutil.rmtree(output_path)
-        return {"status": "error", "message": str(e)}
+        raise HTTPException(
+            status_code=400, detail=f"Error when running the model.\n {str(e)}")
+
+    success = await Output.insert_one(docInsert)
+    if not success:
+        shutil.rmtree(output_path)
+        raise HTTPException(
+            status_code=500, detail="Error while saving the result to the database")
+    return {
+        "status": "success",
+        "message": f"URI to get the result http://localhost:8000/result?unique_id={success.id}",
+        "data": {
+            "id": str(success.id),
+            "model_id": success.model_id,
+            "model_type": success.model_type,
+            "created_at": success.created_at,
+            "speed": success.speed,
+            "result": success.result,
+        }}
 
 
 @app.put("/model", tags=["Model Management"])
@@ -519,6 +539,13 @@ async def update_model(
     model_type: Annotated[SupportedModelType, Form()] = None,
     model_file: Annotated[UploadFile, File()] = None,
 ):
+
+    try:
+        uuid_obj = uuid.UUID(model_id, version=1)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="unique id is not valid")
+
     metadata = await Model.get(model_id)
     if not metadata:
         raise HTTPException(
@@ -607,6 +634,12 @@ async def update_model(
 @app.delete("/model", tags=["Model Management"])
 async def delete_model(model_id: str):
 
+    try:
+        uuid_obj = uuid.UUID(model_id, version=1)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="unique id is not valid")
+
     metadata = await Model.get(model_id)
     if not metadata:
         raise HTTPException(
@@ -641,8 +674,15 @@ async def delete_model(model_id: str):
         return {"status": "error", "message": str(e)}
 
 
-@app.get("/get_image", tags=["Get Result"])
+@app.get("/result/image", tags=["Get Result"])
 async def get_image(unique_id: str):
+
+    try:
+        uuid_obj = uuid.UUID(unique_id, version=1)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="unique id is not valid")
+
     if not os.path.exists(f"{settings.OUTPUT_DIR}/{unique_id}"):
         raise HTTPException(
             status_code=404, detail="file not found. either the unique id is wrong or the model is not yet finished processing the image")
@@ -653,25 +693,30 @@ async def get_image(unique_id: str):
         return {"status": "error", "message": str(e)}
 
 
-@app.get("/get_data", tags=["Get Result"])
+@app.get("/result/data", tags=["Get Result"])
 async def get_result(unique_id: str):
+
     try:
-        result = await Output.get(unique_id)
-        if not result:
-            raise HTTPException(
-                status_code=404, detail="result not found. either the unique id is wrong or the model is not yet finished processing the image")
-        return {
-            "status": "success",
-            "data": {
-                "id": str(result.id),
-                "model_id": result.model_id,
-                "model_type": result.model_type,
-                "created_at": result.created_at,
-                "speed": result.speed,
-                "result": result.result,
-            }}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+        uuid_obj = uuid.UUID(unique_id, version=1)
+    except ValueError:
+        raise HTTPException(
+            status_code=400, detail="unique id is not valid")
+
+    result = await Output.get(unique_id)
+    if result is None:
+        raise HTTPException(
+            status_code=404, detail="Result not found in database")
+
+    return {
+        "status": "success",
+        "data": {
+            "id": str(result.id),
+            "model_id": result.model_id,
+            "model_type": result.model_type,
+            "created_at": result.created_at,
+            "speed": result.speed,
+            "result": result.result,
+        }}
 
 
 @app.get("/result", tags=["Get Result"])
@@ -684,9 +729,24 @@ async def result(unique_id: str):
     </head>
     <body>
     <h1>Result</h1>
-    <img src="http://localhost:8000/get_image?unique_id={unique_id}" alt="Result">
-    <embed src="http://localhost:8000/get_data?unique_id={unique_id}" width="100%" height="100%">
+    <img src="http://localhost:8000/result/image?unique_id={unique_id}" alt="Result">
+    <embed src="http://localhost:8000/result/data?unique_id={unique_id}" width="100%" height="100%">
     </body>
     </html>
     """
     return HTMLResponse(content=Response.replace("{unique_id}", unique_id), status_code=200)
+
+# Delete all the output folder and in database
+
+
+@app.delete("/delete_all", tags=["Delete All"])
+async def delete_all():
+    try:
+        await Output.delete_all()
+        shutil.rmtree(settings.OUTPUT_DIR)
+        return {
+            "status": "success",
+            "message": "all result deleted"
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
